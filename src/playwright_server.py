@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Browser, BrowserContext
 import asyncio
-import uvicorn
 import time
 from config import Cofiguration
 from contextlib import asynccontextmanager
@@ -83,9 +82,10 @@ async def initialize_browser():
             args=[
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
+                '--disable-blink-features=AutomationControlled',  # Critical!
+                '--exclude-switches=enable-automation',  # Hide automation
+                '--disable-infobars',  # Remove info bars
                 '--window-size=1920,1080',
-                '--disable-infobars',
                 '--disable-popup-blocking',
                 '--disable-background-networking',
                 '--disable-default-apps',
@@ -93,16 +93,16 @@ async def initialize_browser():
                 '--metrics-recording-only',
                 '--mute-audio',
                 '--no-first-run',
-                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-features=IsolateOrigins,site-per-process,Automation',  # Disable automation feature
                 '--allow-running-insecure-content',
                 '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
+                '--use-fake-ui-for-media-stream',
+                '--use-fake-device-for-media-stream'
             ],
             ignore_https_errors=True,
             locale='en-US',
             timezone_id='UTC',
-            # Important: Don't override user agent - use Chrome's default
-            # This helps with fingerprinting
+            chromium_sandbox=False
         )
         
         print(f"[+] Browser context initialized with Chrome: {chrome_path}")
@@ -231,11 +231,50 @@ async def fetch_url_with_page(url: str, timeout: int, request_id: int):
         page = await _browser_context.new_page()
         print(f"[Req-{request_id}] Created new page")
         
-        # Minimal stealth - only hide webdriver flag
+        # Enhanced stealth - remove all automation detection
         await page.add_init_script("""
+            // Remove webdriver flag
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined,
             });
+            
+            // Remove automation property
+            delete navigator.__proto__.webdriver;
+            
+            // Override plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            
+            // Override languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            
+            // Add chrome object
+            window.chrome = {
+                runtime: {},
+                loadTimes: () => {},
+                csi: () => {},
+                app: {}
+            };
+            
+            // Spoof permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Hide automation in toString
+            const originalToString = Function.prototype.toString;
+            Function.prototype.toString = function() {
+                if (this === window.navigator.constructor) {
+                    return 'function Navigator() { [native code] }';
+                }
+                return originalToString.call(this);
+            };
         """)
         
         print(f"[Req-{request_id}] Navigating to: {url}")
@@ -357,5 +396,5 @@ async def fetch_page(request: FetchRequest):
 
 
 if __name__ == "__main__":
-    
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
