@@ -40,7 +40,6 @@ def initialize_chrome():
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-software-rasterizer")
-        options.add_argument("--disable-extensions")
         options.add_argument("--disable-plugins")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--no-first-run")
