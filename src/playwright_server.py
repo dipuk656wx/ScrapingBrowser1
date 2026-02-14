@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Browser, BrowserContext
 import asyncio
+import uvicorn
 import time
 from config import Cofiguration
 from contextlib import asynccontextmanager
@@ -35,13 +36,17 @@ async def initialize_browser():
     try:
         print("[*] Initializing Playwright with system Chrome...")
         
-        # Profile path
-        profile_path = '/tmp/chrome_profile_playwright'
-        if os.path.exists(profile_path):
-            shutil.rmtree(profile_path, ignore_errors=True)
-        os.makedirs(profile_path, exist_ok=True)
+        # Use same profile path as your original code for consistency
+        profile_path = '/tmp/chrome_profile'
         
-        # Remove stale lock file
+        # Create if doesn't exist, but DON'T delete existing profile
+        if not os.path.exists(profile_path):
+            os.makedirs(profile_path, exist_ok=True)
+            print(f"[*] Created new profile at: {profile_path}")
+        else:
+            print(f"[*] Using existing profile at: {profile_path}")
+        
+        # Remove stale lock file only
         lock_file = os.path.join(profile_path, 'SingletonLock')
         if os.path.exists(lock_file):
             os.remove(lock_file)
@@ -82,17 +87,22 @@ async def initialize_browser():
                 '--window-size=1920,1080',
                 '--disable-infobars',
                 '--disable-popup-blocking',
-                '--disable-extensions',
                 '--disable-background-networking',
                 '--disable-default-apps',
                 '--disable-sync',
                 '--metrics-recording-only',
                 '--mute-audio',
-                '--no-first-run'
+                '--no-first-run',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--allow-running-insecure-content',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
             ],
             ignore_https_errors=True,
             locale='en-US',
-            timezone_id='UTC'
+            timezone_id='UTC',
+            # Important: Don't override user agent - use Chrome's default
+            # This helps with fingerprinting
         )
         
         print(f"[+] Browser context initialized with Chrome: {chrome_path}")
@@ -126,11 +136,12 @@ async def cleanup_browser():
 
 
 async def bypass_cloudflare(page, max_attempts=20):
-    """Bypass Cloudflare challenge using Tab+Space technique"""
-    print("[*] Checking for Cloudflare challenge...")
+    """Bypass Cloudflare challenge using Tab+Space technique (matches JS code)"""
+    print("[*] Checking for Cloudflare/security challenge...")
     
     attempts = 0
     last_check_time = time.time()
+    security_detected = False
     
     while attempts < max_attempts:
         try:
@@ -139,48 +150,53 @@ async def bypass_cloudflare(page, max_attempts=20):
             if current_time - last_check_time >= 3:
                 attempts += 1
                 
+                # Get page content
                 page_source = await page.content()
-                page_text = await page.evaluate("() => document.body.innerText")
+                try:
+                    page_text = await page.evaluate("() => document.body.innerText")
+                except:
+                    page_text = ""
                 
-                # Check if Cloudflare challenge is present
-                is_cloudflare = (
+                # Check for Cloudflare/security challenges (same as JS code)
+                is_challenge = (
                     "Verifying you are human" in page_source or 
                     "Just a moment" in page_source or
                     "challenges.cloudflare.com" in page_source or
                     "Performing security verification" in page_source or
-                    "Incompatible browser" in page_text
+                    "Incompatible browser" in page_text or
+                    "security service" in page_text.lower()
                 )
                 
-                if not is_cloudflare:
-                    print("[+] No Cloudflare challenge detected or already bypassed")
+                if is_challenge:
+                    security_detected = True
+                    print(f"[*] Cloudflare/security challenge detected! Attempt {attempts}/{max_attempts}")
+                    
+                    # Try Tab + Space (first 5 attempts)
+                    if attempts <= 5:
+                        try:
+                            await page.keyboard.press('Tab')
+                            await asyncio.sleep(0.3)
+                            await page.keyboard.press('Space')
+                            print(f"[*] Tab + Space sent")
+                        except Exception as e:
+                            print(f"[*] Could not send keys, waiting for auto-bypass...")
+                    
+                    # Wait for Cloudflare to auto-verify (like JS code - 4 seconds)
+                    await asyncio.sleep(4)
+                    
+                elif (security_detected or len(page_source) > 500) and len(page_text.strip()) > 100:
+                    # Security was detected and now page has real content
+                    print(f"[+] Cloudflare bypass successful!")
                     return True
-                
-                print(f"[*] Cloudflare detected - Attempt {attempts}/{max_attempts}")
-                
-                # Try Tab + Space
-                if attempts <= 5:
-                    try:
-                        await page.keyboard.press('Tab')
-                        await asyncio.sleep(0.3)
-                        await page.keyboard.press('Space')
-                        print("[*] Tab + Space sent")
-                    except Exception as e:
-                        print(f"[*] Could not send keys: {e}")
-                
-                # Wait for auto-bypass
-                await asyncio.sleep(4)
-                
-                # Check if bypassed
-                page_source = await page.content()
-                page_text = await page.evaluate("() => document.body.innerText")
-                
-                is_cloudflare_now = (
-                    "Verifying you are human" in page_source or 
-                    "Just a moment" in page_source
-                )
-                
-                if not is_cloudflare_now and len(page_text.strip()) > 100:
-                    print("[+] Cloudflare challenge bypassed!")
+                    
+                elif len(page_source) < 200:
+                    # Page still loading
+                    print(f"[*] Page loading... (attempt {attempts})")
+                    await asyncio.sleep(2)
+                    
+                else:
+                    # Page has content, no challenge detected
+                    print(f"[+] Page content loaded (no challenge or already bypassed)")
                     return True
                 
                 last_check_time = current_time
@@ -215,35 +231,11 @@ async def fetch_url_with_page(url: str, timeout: int, request_id: int):
         page = await _browser_context.new_page()
         print(f"[Req-{request_id}] Created new page")
         
-        # Set realistic headers
-        await page.set_extra_http_headers({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-User': '?1',
-            'Sec-Fetch-Dest': 'document'
-        })
-        
-        # Stealth mode
+        # Minimal stealth - only hide webdriver flag
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined,
             });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'],
-            });
-            window.chrome = {
-                runtime: {},
-                loadTimes: () => {},
-                csi: () => {}
-            };
         """)
         
         print(f"[Req-{request_id}] Navigating to: {url}")
@@ -365,5 +357,5 @@ async def fetch_page(request: FetchRequest):
 
 
 if __name__ == "__main__":
-    import uvicorn
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
