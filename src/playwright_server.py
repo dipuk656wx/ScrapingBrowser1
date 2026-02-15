@@ -76,7 +76,7 @@ def initialize_driver_pool():
     global _driver_pool, _driver_queue
     
     print(f"[*] Initializing driver pool with {DRIVER_POOL_SIZE} drivers...")
-    print(f"[*] All drivers will share profile: /tmp/chrome_profile")
+    print(f"[*] All drivers will share profile: /tmp/chrome_profile_fastapi")
     
     for i in range(DRIVER_POOL_SIZE):
         driver_obj = create_chrome_driver(i)
