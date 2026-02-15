@@ -8,13 +8,14 @@ import time
 from config import Cofiguration
 from contextlib import asynccontextmanager
 import os
-import threading
+import shutil
 
-# Global Chrome driver - single instance
-_global_driver = None
-_driver_lock = threading.Lock()  # For thread-safe driver operations
-_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent requests
-_request_counter = 0
+# Configuration
+DRIVER_POOL_SIZE = getattr(Cofiguration, 'driver_pool_size', 5)
+
+# Global driver pool
+_driver_pool = []
+_driver_queue = None
 
 
 class FetchRequest(BaseModel):
@@ -30,12 +31,10 @@ class FetchResponse(BaseModel):
     error: str | None
 
 
-def initialize_chrome():
-    """Initialize single Chrome driver with your working config"""
-    global _global_driver
-    
+def create_chrome_driver(driver_id):
+    """Create Chrome driver with your working undetected-chromedriver config"""
     try:
-        print("[*] Initializing Chrome driver...")
+        print(f"[*] Initializing Chrome driver #{driver_id}...")
         
         options = uc.ChromeOptions()
         options.add_argument("--no-sandbox")
@@ -48,56 +47,74 @@ def initialize_chrome():
         options.add_argument("--no-first-run")
         options.add_argument("--window-size=1920,1080")
         
-        # Use same profile as your working code
-        user_data_dir = '/tmp/chrome_profile'
+        # IMPORTANT: Use shared profile for all drivers to reuse Cloudflare cookies
+        user_data_dir = '/tmp/chrome_profile_fastapi'
         
-        # Preserve existing profile
+        # Create if doesn't exist, preserve if exists
         if not os.path.exists(user_data_dir):
             os.makedirs(user_data_dir, exist_ok=True)
-            print(f"[*] Created profile: {user_data_dir}")
-        else:
-            print(f"[*] Using existing profile: {user_data_dir}")
         
         options.add_argument(f'--user-data-dir={user_data_dir}')
         
-        _global_driver = uc.Chrome(
+        driver = uc.Chrome(
             options=options,
             version_main=None,
             use_subprocess=True
         )
         
-        _global_driver.set_page_load_timeout(100)
-        
-        # Store home handle
-        _global_driver._home_handle = _global_driver.current_window_handle
-        
-        print("[+] Chrome driver initialized successfully")
-        print(f"[+] Home handle: {_global_driver._home_handle[:8]}...")
-        return True
+        driver.set_page_load_timeout(100)
+        print(f"[+] Chrome driver #{driver_id} initialized")
+        return {'id': driver_id, 'driver': driver}
         
     except Exception as e:
-        print(f"[-] Failed to initialize Chrome: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print(f"[-] Failed to initialize Chrome driver #{driver_id}: {e}")
+        return None
 
 
-def cleanup_chrome():
-    """Cleanup Chrome driver"""
-    global _global_driver
+def initialize_driver_pool():
+    """Initialize pool of Chrome drivers"""
+    global _driver_pool, _driver_queue
     
-    try:
-        if _global_driver:
-            print("[*] Closing Chrome driver...")
-            _global_driver.quit()
-            _global_driver = None
-            print("[+] Chrome driver closed")
-    except Exception as e:
-        print(f"[!] Error closing driver: {e}")
+    print(f"[*] Initializing driver pool with {DRIVER_POOL_SIZE} drivers...")
+    print(f"[*] All drivers will share profile: /tmp/chrome_profile")
+    
+    for i in range(DRIVER_POOL_SIZE):
+        driver_obj = create_chrome_driver(i)
+        if driver_obj:
+            _driver_pool.append(driver_obj)
+        time.sleep(2)  # Small delay between driver launches
+    
+    print(f"[+] Driver pool initialized with {len(_driver_pool)}/{DRIVER_POOL_SIZE} drivers")
+    
+    # Create async queue
+    _driver_queue = asyncio.Queue()
+    for driver_obj in _driver_pool:
+        _driver_queue.put_nowait(driver_obj)
+    
+    return len(_driver_pool) > 0
 
 
-def bypass_cloudflare_on_handle(driver, window_handle, max_attempts=20):
-    """Bypass Cloudflare on specific window handle"""
+def cleanup_driver_pool():
+    """Cleanup all Chrome drivers"""
+    global _driver_pool
+    
+    print(f"[*] Closing {len(_driver_pool)} Chrome drivers...")
+    
+    for driver_obj in _driver_pool:
+        try:
+            driver_obj['driver'].quit()
+            print(f"[+] Driver #{driver_obj['id']} closed")
+        except Exception as e:
+            print(f"[!] Error closing driver #{driver_obj['id']}: {e}")
+    
+    _driver_pool.clear()
+    print("[+] All drivers closed")
+
+
+def bypass_cloudflare(driver, max_attempts=20):
+    """Bypass Cloudflare using your working Tab+Space technique"""
+    print("[*] Checking for Cloudflare challenge...")
+    
     attempts = 0
     last_check_time = time.time()
     
@@ -108,160 +125,97 @@ def bypass_cloudflare_on_handle(driver, window_handle, max_attempts=20):
             if current_time - last_check_time >= 3:
                 attempts += 1
                 
-                # Switch to this tab to check
-                with _driver_lock:
-                    if window_handle not in driver.window_handles:
-                        return False
-                    driver.switch_to.window(window_handle)
-                    page_source = driver.page_source
+                page_source = driver.page_source
                 
                 # Check for Cloudflare
-                is_cloudflare = "Verifying you are human" in page_source or "Just a moment" in page_source
-                
-                if not is_cloudflare:
+                if "Verifying you are human" not in page_source and "Just a moment" not in page_source:
+                    print("[+] No Cloudflare challenge or already bypassed")
                     return True
                 
-                print(f"[{window_handle[:8]}] Cloudflare attempt {attempts}/{max_attempts}")
+                print(f"[*] Cloudflare detected - Attempt {attempts}/{max_attempts}: Sending Tab + Space...")
                 
-                # Send Tab + Space
-                with _driver_lock:
-                    if window_handle in driver.window_handles:
-                        driver.switch_to.window(window_handle)
-                        actions = ActionChains(driver)
-                        actions.send_keys(Keys.TAB).perform()
-                        time.sleep(0.3)
-                        actions.send_keys(Keys.SPACE).perform()
+                actions = ActionChains(driver)
+                actions.send_keys(Keys.TAB).perform()
+                time.sleep(0.3)
+                actions.send_keys(Keys.SPACE).perform()
                 
                 time.sleep(2)
                 
                 # Check if bypassed
-                with _driver_lock:
-                    if window_handle in driver.window_handles:
-                        driver.switch_to.window(window_handle)
-                        page_source = driver.page_source
-                        if "Verifying you are human" not in page_source and "Just a moment" not in page_source:
-                            print(f"[{window_handle[:8]}] Cloudflare bypassed!")
-                            return True
+                page_source = driver.page_source
+                if "Verifying you are human" not in page_source and "Just a moment" not in page_source:
+                    print("[+] Cloudflare challenge bypassed!")
+                    return True
                 
                 last_check_time = current_time
             
             time.sleep(0.5)
             
         except Exception as e:
-            print(f"[{window_handle[:8]}] Cloudflare bypass error: {e}")
+            print(f"[-] Cloudflare bypass error: {e}")
             return False
     
+    print(f"[-] Failed to bypass Cloudflare after {max_attempts} attempts")
     return False
 
 
-async def fetch_url_with_tab(url: str, timeout: int, request_id: int):
-    """Fetch URL in new tab with independent polling"""
-    global _global_driver
+async def fetch_url_with_driver(url: str, timeout: int):
+    """Fetch URL using a driver from the pool"""
+    global _driver_queue
     
-    if _global_driver is None:
+    if _driver_queue is None:
         return FetchResponse(
             success=False,
             html=None,
             final_url=None,
             cloudflare_bypassed=False,
-            error="Chrome driver not initialized"
+            error="Driver pool not initialized"
         )
     
-    tab_handle = None
-    start_time = time.time()
+    # Get a driver from the pool (waits if all busy)
+    driver_obj = await _driver_queue.get()
+    driver = driver_obj['driver']
+    driver_id = driver_obj['id']
     
     try:
-        # Step 1: Open new tab (thread-safe)
-        def _open_tab():
-            nonlocal tab_handle
-            with _driver_lock:
-                _global_driver.switch_to.new_window('tab')
-                tab_handle = _global_driver.current_window_handle
-                print(f"[Req-{request_id}] Opened tab: {tab_handle[:8]}...")
-                
-                # Navigate
-                _global_driver.get(url)
-                print(f"[Req-{request_id}] Started loading: {url}")
+        print(f"[Driver-{driver_id}] Acquired for: {url}")
         
-        await asyncio.to_thread(_open_tab)
-        
-        if not tab_handle:
-            raise Exception("Failed to create tab")
-        
-        # Step 2: Poll this tab until loaded (without blocking other tabs)
-        cloudflare_bypassed = False
-        page_loaded = False
-        
-        while time.time() - start_time < timeout:
-            await asyncio.sleep(1)  # Check every second
+        def _fetch():
+            # Navigate
+            print(f"[Driver-{driver_id}] Navigating...")
+            driver.get(url)
+            time.sleep(3)
             
-            # Check page status
-            def _check_page():
-                nonlocal cloudflare_bypassed, page_loaded
-                
-                with _driver_lock:
-                    # Make sure tab still exists
-                    if tab_handle not in _global_driver.window_handles:
-                        raise Exception("Tab was closed")
-                    
-                    # Switch to this tab
-                    _global_driver.switch_to.window(tab_handle)
-                    
-                    # Get page source
-                    page_source = _global_driver.page_source
-                    
-                    # Check for Cloudflare
-                    if "Verifying you are human" in page_source or "Just a moment" in page_source:
-                        return 'cloudflare'
-                    
-                    # Check if page loaded
-                    ready_state = _global_driver.execute_script("return document.readyState")
-                    if ready_state == "complete" and len(page_source) > 500:
-                        return 'loaded'
-                    
-                    return 'loading'
+            # Check for Cloudflare
+            cloudflare_bypassed = False
+            page_source = driver.page_source
             
-            try:
-                status = await asyncio.to_thread(_check_page)
-                
-                if status == 'cloudflare':
-                    print(f"[Req-{request_id}] Cloudflare detected, bypassing...")
-                    # Bypass Cloudflare on this specific tab
-                    bypassed = await asyncio.to_thread(
-                        bypass_cloudflare_on_handle,
-                        _global_driver,
-                        tab_handle,
-                        getattr(Cofiguration, 'cloudflare_max_attempts', 20)
-                    )
-                    if bypassed:
-                        cloudflare_bypassed = True
-                        print(f"[Req-{request_id}] Cloudflare bypassed, continuing load...")
-                    
-                elif status == 'loaded':
-                    page_loaded = True
-                    print(f"[Req-{request_id}] Page loaded successfully")
+            if "Verifying you are human" in page_source or "Just a moment" in page_source:
+                max_attempts = getattr(Cofiguration, 'cloudflare_max_attempts', 20)
+                cloudflare_bypassed = bypass_cloudflare(driver, max_attempts)
+            
+            # Wait for page load
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                time.sleep(1)
+                try:
+                    ready_state = driver.execute_script("return document.readyState")
+                    if ready_state == "complete":
+                        break
+                except:
                     break
-                    
-            except Exception as e:
-                print(f"[Req-{request_id}] Error checking page: {e}")
-                break
+            
+            # Get final content
+            final_html = driver.page_source
+            final_url = driver.current_url
+            
+            return final_html, final_url, cloudflare_bypassed
         
-        # Step 3: Extract final HTML and URL
-        def _extract_content():
-            with _driver_lock:
-                if tab_handle in _global_driver.window_handles:
-                    _global_driver.switch_to.window(tab_handle)
-                    final_html = _global_driver.page_source
-                    final_url = _global_driver.current_url
-                    return final_html, final_url
-                return None, None
+        # Execute in thread pool
+        result = await asyncio.to_thread(_fetch)
+        html, final_url, cloudflare_bypassed = result
         
-        html, final_url = await asyncio.to_thread(_extract_content)
-        
-        if not html:
-            raise Exception("Could not extract content")
-        
-        print(f"[Req-{request_id}] Successfully fetched - HTML length: {len(html)}")
+        print(f"[Driver-{driver_id}] Success - HTML length: {len(html)}")
         
         return FetchResponse(
             success=True,
@@ -272,74 +226,50 @@ async def fetch_url_with_tab(url: str, timeout: int, request_id: int):
         )
         
     except Exception as e:
-        print(f"[Req-{request_id}] Error: {e}")
+        print(f"[Driver-{driver_id}] Error: {e}")
         
         # Try to get partial content
         try:
-            def _get_partial():
-                with _driver_lock:
-                    if tab_handle and tab_handle in _global_driver.window_handles:
-                        _global_driver.switch_to.window(tab_handle)
-                        return _global_driver.page_source, _global_driver.current_url
-                return None, None
+            partial_html = await asyncio.to_thread(lambda: driver.page_source)
+            partial_url = await asyncio.to_thread(lambda: driver.current_url)
             
-            partial_html, partial_url = await asyncio.to_thread(_get_partial)
-            
-            if partial_html:
-                return FetchResponse(
-                    success=False,
-                    html=partial_html,
-                    final_url=partial_url,
-                    cloudflare_bypassed=False,
-                    error=str(e)
-                )
+            return FetchResponse(
+                success=False,
+                html=partial_html,
+                final_url=partial_url,
+                cloudflare_bypassed=False,
+                error=str(e)
+            )
         except:
-            pass
-        
-        return FetchResponse(
-            success=False,
-            html=None,
-            final_url=None,
-            cloudflare_bypassed=False,
-            error=str(e)
-        )
+            return FetchResponse(
+                success=False,
+                html=None,
+                final_url=None,
+                cloudflare_bypassed=False,
+                error=str(e)
+            )
     
     finally:
-        # Step 4: Close tab and return to home
-        if tab_handle:
-            def _close_tab():
-                try:
-                    with _driver_lock:
-                        if tab_handle in _global_driver.window_handles:
-                            _global_driver.switch_to.window(tab_handle)
-                            _global_driver.close()
-                            print(f"[Req-{request_id}] Closed tab: {tab_handle[:8]}...")
-                        
-                        # Return to home handle
-                        if hasattr(_global_driver, '_home_handle') and _global_driver._home_handle in _global_driver.window_handles:
-                            _global_driver.switch_to.window(_global_driver._home_handle)
-                        elif _global_driver.window_handles:
-                            _global_driver.switch_to.window(_global_driver.window_handles[0])
-                except Exception as e:
-                    print(f"[Req-{request_id}] Error closing tab: {e}")
-            
-            await asyncio.to_thread(_close_tab)
+        # Return driver to pool
+        await _driver_queue.put(driver_obj)
+        print(f"[Driver-{driver_id}] Returned to pool")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    print("[*] Starting FastAPI server with undetected-chromedriver...")
+    print("[*] Starting FastAPI server with undetected-chromedriver pool...")
     
-    if not initialize_chrome():
-        print("[-] Failed to initialize Chrome")
+    if not initialize_driver_pool():
+        print("[-] Failed to initialize driver pool")
     
-    print("[+] Server ready - accepts 10 concurrent requests with true parallel tab loading!")
+    print(f"[+] Server ready with {len(_driver_pool)} drivers")
+    print(f"[+] Can handle {len(_driver_pool)} concurrent requests")
     
     yield
     
-    print("[*] Shutting down server...")
-    cleanup_chrome()
+    print("[*] Shutting down...")
+    cleanup_driver_pool()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -348,21 +278,15 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/fetch", response_model=FetchResponse)
 async def fetch_page(request: FetchRequest):
     """
-    Fetch a URL with Cloudflare bypass capability
+    Fetch a URL with Cloudflare bypass
     
     - **url**: The URL to fetch
     - **timeout**: Timeout in seconds (default: 30)
     """
-    global _request_counter
-    
-    async with _semaphore:
-        _request_counter += 1
-        request_id = _request_counter
-        
-        print(f"[Req-{request_id}] Received request for: {request.url}")
-        response = await fetch_url_with_tab(request.url, request.timeout, request_id)
-        print(f"[Req-{request_id}] Completed - Success: {response.success}")
-        return response
+    print(f"[API] Request for: {request.url}")
+    response = await fetch_url_with_driver(request.url, request.timeout)
+    print(f"[API] Completed - Success: {response.success}")
+    return response
 
 
 if __name__ == "__main__":
